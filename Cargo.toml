@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 eframe = "0.29.1"
 sysinfo = { version = "0.32.0", features = ["windows"] }
+tokio = { version = "1.40.0", features = ["full"] }
+tokio-util = "0.7.12"
 
 [profile.release]
 opt-level = "s"

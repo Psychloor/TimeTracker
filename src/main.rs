@@ -5,17 +5,20 @@ use eframe::egui;
 use eframe::egui::{Context, ViewportCommand};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
+use tokio::runtime::Runtime;
+use tokio::time::{sleep, Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 struct ProcessApp {
-    tracked_duration: Arc<RwLock<Duration>>,
-    duration_text: Arc<RwLock<String>>,
+    duration_text: String,
     paused: Arc<AtomicBool>,
-    stopped: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
+    cancellation_token: Option<CancellationToken>,
+    // Sender/Receiver for async notifications.
+    tx: Sender<String>,
+    rx: Receiver<String>,
 
     tracked_process: Option<Pid>,
     tracked_process_name: String,
@@ -27,24 +30,20 @@ struct ProcessApp {
     filtered_processes: HashMap<Pid, String>,
 }
 
-fn create_process_watcher(
+async fn create_process_watcher(
     pid: Pid,
-    tracked_duration: Arc<RwLock<Duration>>,
-    duration_text: Arc<RwLock<String>>,
     paused_param: Arc<AtomicBool>,
-    stopped: Arc<AtomicBool>,
+    cancellation_token: CancellationToken,
+    transmitter: Sender<String>,
 ) {
     const REFRESH_DURATION: Duration = Duration::from_millis(200);
     let mut system = System::new_all();
     let mut last_update = Instant::now();
     let mut last_paused = false;
 
-    // Initialize tracked_duration to default
-    if let Ok(mut tracked_duration) = tracked_duration.write() {
-        *tracked_duration = Duration::default();
-    }
+    let mut process_duration = Duration::default();
 
-    while !stopped.load(Ordering::Acquire) {
+    while !cancellation_token.is_cancelled() {
         let paused = paused_param.load(Ordering::Acquire);
         if !paused && last_paused {
             last_update = Instant::now(); // Reset the update time when unpausing
@@ -57,22 +56,15 @@ fn create_process_watcher(
             if let Some(process) = system.process(pid) {
                 if process.status() == ProcessStatus::Run {
                     let now = Instant::now();
-                    let duration_since_last_update = now.duration_since(last_update);
+                    process_duration += now.duration_since(last_update);
 
-                    // Update the tracked duration
-                    if let Ok(mut duration_guard) = tracked_duration.write() {
-                        *duration_guard += duration_since_last_update;
+                    let total_secs = process_duration.as_secs();
+                    let hours = total_secs / 3600;
+                    let minutes = (total_secs % 3600) / 60;
+                    let seconds = total_secs % 60;
 
-                        // Update the duration_text in a separate scope to reduce lock contention
-                        if let Ok(mut duration_text_guard) = duration_text.write() {
-                            let total_secs = duration_guard.as_secs();
-                            let hours = total_secs / 3600;
-                            let minutes = (total_secs % 3600) / 60;
-                            let seconds = total_secs % 60;
-                            *duration_text_guard =
-                                format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
-                        }
-                    }
+                    let _ = transmitter
+                        .send(format!("{:02}:{:02}:{:02}", hours, minutes, seconds).to_string());
 
                     last_update = now; // Update the last_update timestamp
                 }
@@ -82,27 +74,28 @@ fn create_process_watcher(
         }
 
         // Sleep to prevent CPU overuse
-        thread::sleep(REFRESH_DURATION);
+        sleep(REFRESH_DURATION).await;
     }
 }
 
 impl Drop for ProcessApp {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        if self.thread.is_some() {
-            self.thread.take().unwrap().join().unwrap();
+        if let Some(token) = &self.cancellation_token {
+            token.cancel();
         }
     }
 }
 
 impl ProcessApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+
         ProcessApp {
-            tracked_duration: Arc::new(RwLock::new(Duration::default())),
-            duration_text: Arc::new(RwLock::new(String::default())),
+            duration_text: String::default(),
             paused: Arc::new(AtomicBool::new(false)),
-            stopped: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            cancellation_token: None,
+            tx,
+            rx,
 
             tracked_process: None,
             tracked_process_name: String::default(),
@@ -115,15 +108,8 @@ impl ProcessApp {
     }
 
     fn stop_and_join_thread(&mut self) {
-        // Set the stop signal
-        self.stopped.store(true, Ordering::SeqCst);
-
-        // Check if there is a thread to join
-        if let Some(thread) = self.thread.take() {
-            if let Err(e) = thread.join() {
-                // Handle the error if the thread panicked
-                eprintln!("Failed to join thread: {:?}", e);
-            }
+        if let Some(token) = self.cancellation_token.take() {
+            token.cancel();
         }
     }
 
@@ -171,7 +157,10 @@ impl ProcessApp {
                 for (&pid, process) in self.filtered_processes.iter_mut() {
                     if ui.selectable_label(false, process.as_str()).clicked() {
                         if self.tracked_process != Some(pid) {
-                            self.stopped.store(false, Ordering::Relaxed);
+                            if let Some(token) = &self.cancellation_token.take() {
+                                token.cancel();
+                            }
+
                             self.paused.store(false, Ordering::Relaxed);
 
                             self.tracked_process = Some(pid);
@@ -186,20 +175,16 @@ impl ProcessApp {
                             self.filtered_processes.clear();
 
                             // Cloning values to move into the new thread safely
-                            let tracked_duration = self.tracked_duration.clone();
-                            let duration_text = self.duration_text.clone();
                             let paused = self.paused.clone();
-                            let stopped = self.stopped.clone();
+                            let tx = self.tx.clone();
 
-                            self.thread = Some(thread::spawn(move || {
-                                create_process_watcher(
-                                    pid,
-                                    tracked_duration,
-                                    duration_text,
-                                    paused,
-                                    stopped,
-                                );
-                            }));
+                            let cancellation_token = CancellationToken::new();
+                            let token_clone = cancellation_token.clone();
+                            self.cancellation_token = Some(cancellation_token);
+
+                            tokio::spawn(async move {
+                                create_process_watcher(pid, paused, token_clone, tx).await;
+                            });
 
                             return;
                         }
@@ -211,6 +196,10 @@ impl ProcessApp {
 
 impl eframe::App for ProcessApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        while let Ok(duration) = self.rx.try_recv() {
+            self.duration_text = duration;
+        }
+
         egui::TopBottomPanel::top("Process").show(ctx, |ui| {
             ui.horizontal(|ui_hor| {
                 ui_hor.label(format!("Selected Process: {}", self.tracked_process_name));
@@ -240,17 +229,32 @@ impl eframe::App for ProcessApp {
             });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut duration_string = String::default();
-            if let Ok(duration_text) = self.duration_text.read() {
-                duration_string = duration_text.to_string();
-            }
-
-            ui.label(egui::RichText::new(duration_string).size(48f32).monospace());
+            ui.label(
+                egui::RichText::new(self.duration_text.as_str())
+                    .size(48f32)
+                    .monospace(),
+            );
         });
     }
 }
 
 fn main() {
+    let rt = Runtime::new().expect("Unable to create Runtime");
+
+    // Enter the runtime so that `tokio::spawn` is available immediately.
+    let _enter = rt.enter();
+
+    // Execute the runtime in its own thread.
+    // The future doesn't have to do anything. In this example, it just sleeps forever.
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                tokio::task::yield_now().await;
+            }
+        })
+    });
+
     let native_options = eframe::NativeOptions::default();
 
     let _result = eframe::run_native(
