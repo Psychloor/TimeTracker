@@ -3,22 +3,28 @@
 use eframe;
 use eframe::egui;
 use eframe::egui::{Context, ViewportCommand};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
+
 use tokio::runtime::Runtime;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::select;
+use tokio::time::{interval, Duration, Instant};
+
 use tokio_util::sync::CancellationToken;
+
+const REFRESH_DURATION: Duration = Duration::from_millis(200);
 
 struct ProcessApp {
     duration_text: String,
     paused: Arc<AtomicBool>,
     cancellation_token: Option<CancellationToken>,
-    // Sender/Receiver for async notifications.
-    tx: Sender<String>,
-    rx: Receiver<String>,
+    duration_tx: Sender<String>,
+    duration_rx: Receiver<String>,
 
     tracked_process: Option<Pid>,
     tracked_process_name: String,
@@ -34,47 +40,52 @@ async fn create_process_watcher(
     pid: Pid,
     paused_param: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    transmitter: Sender<String>,
+    duration_tx: Sender<String>,
 ) {
-    const REFRESH_DURATION: Duration = Duration::from_millis(200);
     let mut system = System::new_all();
     let mut last_update = Instant::now();
     let mut last_paused = false;
 
     let mut process_duration = Duration::default();
+    let mut update_interval = interval(REFRESH_DURATION);
+    let mut stopped = false;
 
-    while !cancellation_token.is_cancelled() {
-        let paused = paused_param.load(Ordering::Acquire);
-        if !paused && last_paused {
-            last_update = Instant::now(); // Reset the update time when unpausing
-        }
-        last_paused = paused;
-
-        if !paused {
-            system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-
-            if let Some(process) = system.process(pid) {
-                if process.status() == ProcessStatus::Run {
-                    let now = Instant::now();
-                    process_duration += now.duration_since(last_update);
-
-                    let total_secs = process_duration.as_secs();
-                    let hours = total_secs / 3600;
-                    let minutes = (total_secs % 3600) / 60;
-                    let seconds = total_secs % 60;
-
-                    let _ = transmitter
-                        .send(format!("{:02}:{:02}:{:02}", hours, minutes, seconds).to_string());
-
-                    last_update = now; // Update the last_update timestamp
+    while !stopped {
+        select! {
+            _ = cancellation_token.cancelled() => {
+                stopped = true;
+            }
+            _ = update_interval.tick() => {
+                let paused = paused_param.load(Ordering::Acquire);
+                if !paused && last_paused {
+                    last_update = Instant::now(); // Reset the update time when un-pausing
                 }
-            } else {
-                break; // Exit the loop if the process no longer exists
+                last_paused = paused;
+
+                if !paused {
+                    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+
+                    if let Some(process) = system.process(pid) {
+                        if process.status() == ProcessStatus::Run {
+                            let now = Instant::now();
+                            process_duration += now.saturating_duration_since(last_update);
+
+                            let total_secs = process_duration.as_secs();
+                            let hours = total_secs / 3600;
+                            let minutes = (total_secs % 3600) / 60;
+                            let seconds = total_secs % 60;
+
+                            let _ = duration_tx
+                                .send(format!("{:02}:{:02}:{:02}", hours, minutes, seconds).to_string());
+
+                            last_update = now; // Update the last_update timestamp
+                        }
+                    } else {
+                        break; // Exit the loop if the process no longer exists
+                    }
+                }
             }
         }
-
-        // Sleep to prevent CPU overuse
-        sleep(REFRESH_DURATION).await;
     }
 }
 
@@ -91,11 +102,11 @@ impl ProcessApp {
         let (tx, rx) = std::sync::mpsc::channel();
 
         ProcessApp {
-            duration_text: String::default(),
+            duration_text: "00:00:00".to_string(),
             paused: Arc::new(AtomicBool::new(false)),
             cancellation_token: None,
-            tx,
-            rx,
+            duration_tx: tx,
+            duration_rx: rx,
 
             tracked_process: None,
             tracked_process_name: String::default(),
@@ -133,11 +144,16 @@ impl ProcessApp {
     }
 
     fn open_process_list_window(&mut self, ctx: &Context) {
+        let mut is_window_open = self.process_window_open;
+        let mut should_close_window = false;
+
         egui::Window::new("Select Process")
             .title_bar(true)
             .movable(true)
             .collapsible(false)
             .scroll([false, true])
+            .open(&mut is_window_open)
+            .resizable(false)
             .show(ctx, |ui| {
                 // Filter textbox
                 if ui
@@ -151,8 +167,6 @@ impl ProcessApp {
                 }
 
                 ui.separator();
-                self.stop_and_join_thread();
-
                 // List of processes
                 for (&pid, process) in self.filtered_processes.iter_mut() {
                     if ui.selectable_label(false, process.as_str()).clicked() {
@@ -165,18 +179,16 @@ impl ProcessApp {
 
                             self.tracked_process = Some(pid);
                             self.tracked_process_name = process.clone();
-                            self.process_window_open = false;
+                            should_close_window = true;
 
                             ctx.send_viewport_cmd(ViewportCommand::Title(format!(
                                 "Time Tracker - {}",
                                 process
                             )));
 
-                            self.filtered_processes.clear();
-
                             // Cloning values to move into the new thread safely
                             let paused = self.paused.clone();
-                            let tx = self.tx.clone();
+                            let tx = self.duration_tx.clone();
 
                             let cancellation_token = CancellationToken::new();
                             let token_clone = cancellation_token.clone();
@@ -186,17 +198,22 @@ impl ProcessApp {
                                 create_process_watcher(pid, paused, token_clone, tx).await;
                             });
 
-                            return;
+                            break;
                         }
                     }
                 }
             });
+
+        self.process_window_open = is_window_open;
+        if should_close_window {
+            self.process_window_open = false;
+        }
     }
 }
 
 impl eframe::App for ProcessApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        while let Ok(duration) = self.rx.try_recv() {
+        while let Ok(duration) = self.duration_rx.try_recv() {
             self.duration_text = duration;
         }
 
@@ -211,9 +228,14 @@ impl eframe::App for ProcessApp {
                     self.process_window_open = true;
                 }
 
-                if ui_hor.button("Pause").clicked() {
-                    let paus = self.paused.load(Ordering::SeqCst);
-                    self.paused.store(!paus, Ordering::Release);
+                let paused_text = if self.paused.load(Ordering::Relaxed) {
+                    "Un-Pause"
+                } else {
+                    "Pause"
+                };
+                if ui_hor.button(paused_text).clicked() {
+                    let paused = self.paused.load(Ordering::SeqCst);
+                    self.paused.store(!paused, Ordering::Release);
                 }
 
                 if ui_hor.button("Stop").clicked() {
@@ -235,23 +257,24 @@ impl eframe::App for ProcessApp {
                     .monospace(),
             );
         });
+
+        ctx.request_repaint_after_secs(0.25_f32)
     }
 }
 
 fn main() {
     let rt = Runtime::new().expect("Unable to create Runtime");
+    let exit_process_token = CancellationToken::new();
+    let exit_process_clone = exit_process_token.clone();
 
     // Enter the runtime so that `tokio::spawn` is available immediately.
     let _enter = rt.enter();
 
     // Execute the runtime in its own thread.
     // The future doesn't have to do anything. In this example, it just sleeps forever.
-    std::thread::spawn(move || {
-        rt.block_on(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                tokio::task::yield_now().await;
-            }
+    let rt_thread = std::thread::spawn(move || {
+        rt.block_on(async move {
+            exit_process_clone.cancelled().await;
         })
     });
 
@@ -262,4 +285,7 @@ fn main() {
         native_options,
         Box::new(|cc| Ok(Box::new(ProcessApp::new(cc)))),
     );
+
+    exit_process_token.cancel();
+    rt_thread.join().unwrap();
 }
