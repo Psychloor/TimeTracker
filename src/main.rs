@@ -5,9 +5,9 @@ use eframe::egui;
 use eframe::egui::{Context, ViewportCommand};
 
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
 
@@ -19,74 +19,69 @@ use tokio_util::sync::CancellationToken;
 
 const REFRESH_DURATION: Duration = Duration::from_millis(200);
 
-struct ProcessApp {
-    duration_text: String,
-    paused: Arc<AtomicBool>,
-    cancellation_token: Option<CancellationToken>,
-    duration_tx: Sender<String>,
-    duration_rx: Receiver<String>,
-
-    tracked_process: Option<Pid>,
-    tracked_process_name: String,
-    system: System,
-
-    process_window_open: bool,
-
-    process_filter: String,
-    filtered_processes: HashMap<Pid, String>,
-}
-
-async fn create_process_watcher(
+async fn process_watcher_async(
     pid: Pid,
     paused_param: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    duration_tx: Sender<String>,
+    duration_text: Arc<RwLock<String>>,
 ) {
     let mut system = System::new_all();
     let mut last_update = Instant::now();
-    let mut last_paused = false;
 
     let mut process_duration = Duration::default();
     let mut update_interval = interval(REFRESH_DURATION);
-    let mut stopped = false;
 
-    while !stopped {
+    loop {
         select! {
             _ = cancellation_token.cancelled() => {
-                stopped = true;
-            }
+                return;
+            },
             _ = update_interval.tick() => {
-                let paused = paused_param.load(Ordering::Acquire);
-                if !paused && last_paused {
-                    last_update = Instant::now(); // Reset the update time when un-pausing
-                }
-                last_paused = paused;
-
-                if !paused {
+                if !paused_param.load(Ordering::Relaxed) {
                     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
 
                     if let Some(process) = system.process(pid) {
                         if process.status() == ProcessStatus::Run {
                             let now = Instant::now();
                             process_duration += now.saturating_duration_since(last_update);
+                            last_update = now;
 
                             let total_secs = process_duration.as_secs();
                             let hours = total_secs / 3600;
                             let minutes = (total_secs % 3600) / 60;
                             let seconds = total_secs % 60;
 
-                            let _ = duration_tx
-                                .send(format!("{:02}:{:02}:{:02}", hours, minutes, seconds).to_string());
-
-                            last_update = now; // Update the last_update timestamp
+                            if let Ok(mut duration_txt) = duration_text.write() {
+                                duration_txt.clear();
+                                if let Err(e) = write!(&mut duration_txt, "{:02}:{:02}:{:02}", hours, minutes, seconds) {
+                                    eprintln!("Failed to write duration: {}", e);
+                                }
+                            }
                         }
                     } else {
-                        break; // Exit the loop if the process no longer exists
+                        return; // Exit the loop if the process no longer exists
                     }
+                } else {
+                    // Process is paused, reset the last update to avoid accumulating paused time
+                    last_update = Instant::now();
                 }
             }
         }
     }
+}
+
+struct ProcessApp {
+    duration_text: Arc<RwLock<String>>,
+    paused: Arc<AtomicBool>,
+    cancellation_token: Option<CancellationToken>,
+
+    tracked_process: Option<Pid>,
+    tracked_process_name: String,
+    system: System,
+
+    process_window_open: bool,
+    process_filter: String,
+    filtered_processes: HashMap<Pid, String>,
 }
 
 impl Drop for ProcessApp {
@@ -99,14 +94,10 @@ impl Drop for ProcessApp {
 
 impl ProcessApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
-
         ProcessApp {
-            duration_text: "00:00:00".to_string(),
+            duration_text: Arc::new(RwLock::new(String::from("--:--:--"))),
             paused: Arc::new(AtomicBool::new(false)),
             cancellation_token: None,
-            duration_tx: tx,
-            duration_rx: rx,
 
             tracked_process: None,
             tracked_process_name: String::default(),
@@ -188,14 +179,14 @@ impl ProcessApp {
 
                             // Cloning values to move into the new thread safely
                             let paused = self.paused.clone();
-                            let tx = self.duration_tx.clone();
+                            let duration = self.duration_text.clone();
 
                             let cancellation_token = CancellationToken::new();
                             let token_clone = cancellation_token.clone();
                             self.cancellation_token = Some(cancellation_token);
 
                             tokio::spawn(async move {
-                                create_process_watcher(pid, paused, token_clone, tx).await;
+                                process_watcher_async(pid, paused, token_clone, duration).await;
                             });
 
                             break;
@@ -213,10 +204,6 @@ impl ProcessApp {
 
 impl eframe::App for ProcessApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        while let Ok(duration) = self.duration_rx.try_recv() {
-            self.duration_text = duration;
-        }
-
         egui::TopBottomPanel::top("Process").show(ctx, |ui| {
             ui.horizontal(|ui_hor| {
                 ui_hor.label(format!("Selected Process: {}", self.tracked_process_name));
@@ -228,13 +215,9 @@ impl eframe::App for ProcessApp {
                     self.process_window_open = true;
                 }
 
-                let paused_text = if self.paused.load(Ordering::Relaxed) {
-                    "Un-Pause"
-                } else {
-                    "Pause"
-                };
+                let paused = self.paused.load(Ordering::Relaxed);
+                let paused_text = if paused { "Un-Pause" } else { "Pause" };
                 if ui_hor.button(paused_text).clicked() {
-                    let paused = self.paused.load(Ordering::SeqCst);
                     self.paused.store(!paused, Ordering::Release);
                 }
 
@@ -251,11 +234,13 @@ impl eframe::App for ProcessApp {
             });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(self.duration_text.as_str())
-                    .size(48f32)
-                    .monospace(),
-            );
+            if let Ok(duration) = self.duration_text.read() {
+                ui.label(
+                    egui::RichText::new(duration.as_str())
+                        .size(48f32)
+                        .monospace(),
+                );
+            }
         });
 
         ctx.request_repaint_after_secs(0.25_f32)
