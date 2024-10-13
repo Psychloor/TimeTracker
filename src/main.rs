@@ -10,34 +10,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
-
 use tokio::runtime::Runtime;
 use tokio::select;
 use tokio::time::{interval, Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
-const REFRESH_DURATION: Duration = Duration::from_millis(200);
+const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 
 async fn process_watcher_async(
     pid: Pid,
-    paused_param: Arc<AtomicBool>,
-    cancellation_token: CancellationToken,
+    paused: Arc<AtomicBool>,
     duration_text: Arc<RwLock<String>>,
+    cancellation_token: CancellationToken,
+    ctx: Context,
 ) {
     let mut system = System::new_all();
     let mut last_update = Instant::now();
+    let mut last_seconds: u64 = 0;
 
     let mut process_duration = Duration::default();
-    let mut update_interval = interval(REFRESH_DURATION);
+    let mut update_interval = interval(REFRESH_INTERVAL);
 
     loop {
         select! {
+            biased;
             _ = cancellation_token.cancelled() => {
                 return;
             },
             _ = update_interval.tick() => {
-                if !paused_param.load(Ordering::Relaxed) {
+                if !paused.load(Ordering::Relaxed) {
                     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
 
                     if let Some(process) = system.process(pid) {
@@ -47,6 +49,7 @@ async fn process_watcher_async(
                             last_update = now;
 
                             let total_secs = process_duration.as_secs();
+
                             let hours = total_secs / 3600;
                             let minutes = (total_secs % 3600) / 60;
                             let seconds = total_secs % 60;
@@ -57,12 +60,17 @@ async fn process_watcher_async(
                                     eprintln!("Failed to write duration: {}", e);
                                 }
                             }
+
+                            if total_secs != last_seconds {
+                                ctx.request_repaint();
+                            }
+                            last_seconds = total_secs;
                         }
                     } else {
                         return; // Exit the loop if the process no longer exists
                     }
                 } else {
-                    // Process is paused, reset the last update to avoid accumulating paused time
+                    // Tracking is paused, reset the last update to avoid accumulating paused time
                     last_update = Instant::now();
                 }
             }
@@ -165,8 +173,7 @@ impl ProcessApp {
                             if let Some(token) = &self.cancellation_token.take() {
                                 token.cancel();
                             }
-
-                            self.paused.store(false, Ordering::Relaxed);
+                            self.paused.store(false, Ordering::Release);
 
                             self.tracked_process = Some(pid);
                             self.tracked_process_name = process.clone();
@@ -180,13 +187,15 @@ impl ProcessApp {
                             // Cloning values to move into the new thread safely
                             let paused = self.paused.clone();
                             let duration = self.duration_text.clone();
+                            let context = ctx.clone();
 
                             let cancellation_token = CancellationToken::new();
                             let token_clone = cancellation_token.clone();
                             self.cancellation_token = Some(cancellation_token);
 
                             tokio::spawn(async move {
-                                process_watcher_async(pid, paused, token_clone, duration).await;
+                                process_watcher_async(pid, paused, duration, token_clone, context)
+                                    .await;
                             });
 
                             break;
@@ -242,8 +251,6 @@ impl eframe::App for ProcessApp {
                 );
             }
         });
-
-        ctx.request_repaint_after_secs(0.25_f32)
     }
 }
 
